@@ -925,7 +925,10 @@ def main():
                 best_plate = max(associated_plate_boxes, key=lambda p: p['confidence'])
                 x1, y1, x2, y2 = best_plate['bbox']
                 try:
-                    ocr_queue.put_nowait({'frame': annotated_frame, 'bbox': (x1, y1, x2, y2)})
+                    # The main thread draws boxes and labels onto annotated_frame
+                    # immediately after this point. Give OCR an immutable snapshot
+                    # so those overlays cannot race with the crop read.
+                    ocr_queue.put_nowait({'frame': annotated_frame.copy(), 'bbox': (x1, y1, x2, y2)})
                 except Full:
                     pass
 

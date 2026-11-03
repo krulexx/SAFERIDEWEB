@@ -18,6 +18,14 @@ TEMP_MC_NUMERIC_ALPHA_PATTERN = re.compile(r"^\d{3}[A-Z]{3}$")
 TEMP_MC_ALPHA_NUMERIC_PATTERN = re.compile(r"^[A-Z]\d{3}[A-Z]{2}$")
 MV_FILE_PATTERN = re.compile(r"^\d{4}-\d{6,7}$")
 
+# Known Philippine motorcycle plate layouts, from current and older series.
+# A = letter, N = digit. Keep raw OCR fallback too, since LTO may introduce
+# additional series and temporary identifiers do not all share one layout.
+MC_PLATE_LAYOUTS = (
+    "NNNAAA", "ANNNAA", "AANNNA", "NAAANN", "ANNNNA", "ANANNN",
+    "ANNANN", "AANNNN", "NNNNAA", "AANNNNN", "NNNNNAA", "NNNNAAA",
+)
+
 
 def normalize_ocr_text(text: str) -> str:
     return "".join(ch for ch in text.upper() if ch.isalnum())
@@ -116,20 +124,34 @@ def fix_temp_motorcycle_alpha_numeric_format(text: str) -> str:
     return candidate if TEMP_MC_ALPHA_NUMERIC_PATTERN.fullmatch(candidate) else ""
 
 
+def fix_motorcycle_plate_format(text: str) -> str:
+    """Correct common OCR letter/digit confusions for known MC layouts."""
+    clean = normalize_ocr_text(text)
+    for layout in MC_PLATE_LAYOUTS:
+        if len(clean) != len(layout):
+            continue
+        candidate = "".join(
+            (NUMBER_TO_LETTER.get(ch, ch) if kind == "A"
+             else LETTER_TO_NUMBER.get(ch, ch))
+            for ch, kind in zip(clean, layout)
+        )
+        if all(ch.isalpha() if kind == "A" else ch.isdigit()
+               for ch, kind in zip(candidate, layout)):
+            return candidate
+    return ""
+
+
 def fix_plate_format(text: str) -> str:
     """
     Normalize OCR output into a supported Philippine motorcycle identifier.
-    Supported formats:
-      - ABC1234
-      - 1234ABC
-      - 123ABC
-      - A123BC
-      - 1234-123456
-      - 1234-1234567
+    Supports common PH layouts including 123AAA, A123BC, AB123C, 1ABC23,
+    A1234C, A1C234, A12C34, older 4/5-digit motorcycle layouts, and the
+    standard ABC1234 private-vehicle layout. Unknown formats use raw OCR text.
     """
     return (
         fix_standard_plate_format(text)
         or fix_old_motorcycle_plate_format(text)
+        or fix_motorcycle_plate_format(text)
         or fix_temp_motorcycle_numeric_alpha_format(text)
         or fix_temp_motorcycle_alpha_numeric_format(text)
         or fix_mv_file_number_format(text)
@@ -159,6 +181,7 @@ def extract_plate_candidate(texts) -> str:
                 candidate = (
                     fix_standard_plate_format(clean[start:start + 7])
                     or fix_old_motorcycle_plate_format(clean[start:start + 7])
+                    or fix_motorcycle_plate_format(clean[start:start + 7])
                 )
                 if candidate:
                     return candidate
@@ -168,6 +191,7 @@ def extract_plate_candidate(texts) -> str:
                 candidate = (
                     fix_temp_motorcycle_numeric_alpha_format(clean[start:start + 6])
                     or fix_temp_motorcycle_alpha_numeric_format(clean[start:start + 6])
+                    or fix_motorcycle_plate_format(clean[start:start + 6])
                 )
                 if candidate:
                     return candidate
@@ -182,22 +206,19 @@ PLATE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
 def _loose_plate_candidate(texts) -> str:
     """
     Best-effort fallback when nothing matches a strict PH plate format, so the
-    record is not left blank. Accepts a 5-8 char alphanumeric token with >=2
-    letters AND >=2 digits (covers every PH car/motorcycle format) — rejects
-    shirt text like 'FINISHER' (no digits) and fragments like '42K' (too short).
-    An operator can fix a near-miss via the plate-correction workflow; a blank
-    they cannot. MV file numbers stay strict-only (handled above).
+    record is not left blank. Plate formats vary and can be numeric-only,
+    alpha-only, or a different mix of letters and digits.
     """
-    best = ""
+    candidates = []
     for raw_text in texts:
-        clean = normalize_ocr_text(raw_text)
-        if not (5 <= len(clean) <= 8):
+        clean = "".join(
+            ch for ch in str(raw_text).upper()
+            if ch.isalnum() or ch == "-"
+        ).strip("-")
+        if not (2 <= len(clean) <= 20):
             continue
-        n_digit = sum(ch.isdigit() for ch in clean)
-        n_alpha = sum(ch.isalpha() for ch in clean)
-        if n_digit >= 2 and n_alpha >= 2 and len(clean) > len(best):
-            best = clean
-    return best
+        candidates.append(clean)
+    return max(candidates, key=len, default="")
 
 
 def _preprocess_variants(crop):
@@ -207,10 +228,13 @@ def _preprocess_variants(crop):
     the binary still wins on high-contrast plates — so try both.
     """
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_LANCZOS4)
+    gray = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_LANCZOS4)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
     _, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return (clahe, otsu)
+    adaptive = cv2.adaptiveThreshold(
+        clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
+    )
+    return (gray, clahe, otsu, adaptive)
 
 
 def read_plate_text(frame_bgr, x1, y1, x2, y2, reader, ocr_conf=0.2):
@@ -238,7 +262,10 @@ def read_plate_text(frame_bgr, x1, y1, x2, y2, reader, ocr_conf=0.2):
             return ""
 
         strong_texts, all_texts = [], []
-        weak_conf = max(0.10, ocr_conf * 0.5)
+        # Keep a lower floor for recoverable plate reads even when the global
+        # OCR setting is tuned high; the plate has already passed YOLO's plate
+        # detector and will still be shown for operator review.
+        weak_conf = max(0.08, min(0.25, ocr_conf * 0.5))
         for img in _preprocess_variants(crop):
             for (_, text, prob) in reader.readtext(img, allowlist=PLATE_ALLOWLIST):
                 if len(normalize_ocr_text(text)) < 3:
@@ -251,14 +278,21 @@ def read_plate_text(frame_bgr, x1, y1, x2, y2, reader, ocr_conf=0.2):
         if not all_texts:
             return ""
 
+        # EasyOCR can split a plate across multiple text boxes. Try the
+        # reading-order concatenation too, while retaining each token in case
+        # the crop contains unrelated markings.
+        combined_texts = ["".join(all_texts)] if len(all_texts) > 1 else []
+
         # 1) strict PH-format match (highest trust)
         strict = extract_plate_candidate(
-            ["".join(strong_texts), *strong_texts, *all_texts]
+            ["".join(strong_texts), *strong_texts, *combined_texts, *all_texts]
         )
         if strict:
             return strict
 
-        # 2) best-effort raw token so the DB gets a correctable value, not blank
-        return _loose_plate_candidate(all_texts)
-    except Exception:
+        # 2) Keep unfamiliar formats and numeric-only plates instead of
+        # rejecting them for not matching a Philippine plate pattern.
+        return _loose_plate_candidate([*combined_texts, *all_texts])
+    except Exception as exc:
+        print(f"[OCR] Plate recognition failed: {exc}")
         return ""
